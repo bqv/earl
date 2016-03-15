@@ -1,0 +1,60 @@
+#!/usr/bin/env escript
+%-mode(compile)
+%%! -sname earl -nocookie
+-include("conf.hrl").
+
+apploop(SvcPid, Conf) ->
+    receive
+        {'EXIT', _, normal} -> % not a crash
+            ok;
+        {'EXIT', _, shutdown} -> % manual termination, not a crash
+            ok;
+        {'EXIT', SvcPid, Other} ->
+            io:fwrite("{appsv} Supervisor process ~w ended abnormally with code: ~w~n", [SvcPid, Other]),
+            start_svcsv(Conf);
+        Other ->
+            io:fwrite("{appsv} Ignoring undefined message ~w~n", [Other]),
+            apploop(SvcPid, Conf)
+    end.
+
+start_svcsv(Conf) ->
+    process_flag(trap_exit, true),
+    SvcPid = spawn_link(svcsv, init, [Conf]),
+    receive
+        {svcsv, ready} ->
+            apploop(SvcPid, Conf) 
+    after
+        20000 ->
+            erlang:error("Timed out waiting for svcsv boot to complete")
+    end.
+
+main([Host]) ->
+    main([Host, "6667"]);
+main([Host, Port]) ->
+    main([Host, Port, 3]);
+main([Host, PortString, NString]) ->
+    case {maybe_int(PortString), maybe_int(NString)} of
+        {{ok, Port}, {ok, N}} when (Port < 65536) and (Port > 0) and (N > 0) ->
+            io:format("Running Earl.~n~n"),
+            Conf = mk_conf(Host, Port, N),
+            register(appsv, self()),
+            start_svcsv(Conf),
+            io:format("Halt.~n");
+        _ ->
+            usage()
+    end;
+main(_) ->
+    usage().
+
+usage() ->
+    io:format("usage: ./earl host [port [count]]~n"),
+    halt(1).
+
+maybe_int(String) ->
+    try
+        Int = list_to_integer(String),
+        {ok, Int}
+    catch
+        error:badarg ->
+            undefined
+    end.
