@@ -1,42 +1,74 @@
 #!/usr/bin/env escript
 %-mode(compile)
-%%! -sname earl -nocookie
+%%! -name earl@zeta.fron.io -setcookie 34r1
 -include("conf.hrl").
 
-apploop(SvcPid, Conf) ->
+apploop(Mode, Pid, Conf) ->
     receive
         {'EXIT', _, normal} -> % not a crash
             ok;
         {'EXIT', _, shutdown} -> % manual termination, not a crash
             ok;
-        {'EXIT', SvcPid, Other} ->
-            io:fwrite("{appsv} Supervisor process ~w ended abnormally with code: ~w~n", [SvcPid, Other]),
-            start_svcsv(Conf);
+        {'EXIT', Pid, Other} ->
+            io:fwrite("{appsv} Supervisor process ~w ended abnormally with code: ~w~n", [Pid, Other]),
+            case Mode of
+                master ->
+                    start_svcsv(Conf);
+                slave ->
+                    start_remsv(Conf)
+            end;
         Other ->
             io:fwrite("{appsv} Ignoring undefined message ~w~n", [Other]),
-            apploop(SvcPid, Conf)
+            apploop(Mode, Pid, Conf)
     end.
 
 start_svcsv(Conf) ->
     process_flag(trap_exit, true),
-    SvcPid = spawn_link(svcsv, init, [Conf]),
+    Pid = spawn_link(svcsv, init, [Conf]),
     receive
         {svcsv, ready} ->
-            apploop(SvcPid, Conf) 
+            apploop(master, Pid, Conf) 
     after
         20000 ->
             erlang:error("Timed out waiting for svcsv boot to complete")
     end.
 
-main([Host]) ->
+start_remsv(Conf) ->
+    process_flag(trap_exit, true),
+    Pid = spawn_link(remsv, init, [Conf]),
+    receive
+        {remsv, ready} ->
+            apploop(slave, Pid, Conf) 
+    after
+        20000 ->
+            erlang:error("Timed out waiting for remsv boot to complete")
+    end.
+
+main([MasterNode, "--", Host, Chan]) ->
+    main([MasterNode, "--", Host, "6667"]);
+main([MasterNode, "--", Host, Chan, Port]) ->
+    main([MasterNode, "--", Host, Port, 3]);
+main([MasterNode, "--", Host, Chan, PortString, NString]) ->
+    case {maybe_int(PortString), maybe_int(NString)} of
+        {{ok, Port}, {ok, N}} when (Port < 65536) and (Port > 0) and (N > 0) ->
+            io:format("Running Earl Slave.~n~n"),
+            Node = list_to_atom(MasterNode),
+            Conf = mk_conf(Host, Port, Chan, N, Node),
+            register(appsv, self()),
+            start_remsv(Conf),
+            io:format("Halt.~n");
+        _ ->
+            usage()
+    end;
+main([Host, Chan]) ->
     main([Host, "6667"]);
-main([Host, Port]) ->
+main([Host, Chan, Port]) ->
     main([Host, Port, 3]);
-main([Host, PortString, NString]) ->
+main([Host, Chan, PortString, NString]) ->
     case {maybe_int(PortString), maybe_int(NString)} of
         {{ok, Port}, {ok, N}} when (Port < 65536) and (Port > 0) and (N > 0) ->
             io:format("Running Earl.~n~n"),
-            Conf = mk_conf(Host, Port, N),
+            Conf = mk_conf(Host, Port, Chan, N),
             register(appsv, self()),
             start_svcsv(Conf),
             io:format("Halt.~n");
@@ -47,7 +79,7 @@ main(_) ->
     usage().
 
 usage() ->
-    io:format("usage: ./earl host [port [count]]~n"),
+    io:format("usage: ./earl [masternode --] host chan [port [count]]~n"),
     halt(1).
 
 maybe_int(String) ->

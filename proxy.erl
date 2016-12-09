@@ -3,7 +3,7 @@
 
 open(Port) ->
     io:format("{proxy} Opening proxy~n"),
-    svcsv ! {proxy, ready},
+    supervisor ! {proxy, ready},
     {ok, Sock} = gen_tcp:listen(Port, [{packet, line}, {reuseaddr, true}]),
     listen(Sock),
     ok.
@@ -21,11 +21,24 @@ strip(String) ->
             Content
     end.
 
-send(Sock, Command, Args) ->
-    Line = Command++" "++Args++"\r\n",
+send_raw(Sock, Line) ->
     io:fwrite("(<~~) ~s", [Line]),
     ok = gen_tcp:send(Sock, Line),
     ok.
+
+send(Sock, Command, Args) ->
+    Line = Command++" "++Args++"\r\n",
+    ok = send_raw(Sock, Line),
+    ok.
+
+forward(Sock, Line, History) ->
+    case lists:member(Line, History) of
+        true ->
+            History;
+        false ->
+            ok = send_raw(Sock, Line),
+            [Line|lists:sublist(History,15)]
+    end.
 
 dispatch(Sock, Line) ->
     io:fwrite("(>~~) ~s", [Line]),
@@ -38,32 +51,37 @@ dispatch(Sock, Line) ->
         "JOIN" ->
             Chans = strip(string:substr(Line, 4+1 +1)),
             send(Sock, ":earl!"++atom_to_list(node()), "JOIN :"++Chans),
-            netsv ! {send_join, Chans};
+            supervisor ! {send_join, Chans};
         "PRIVMSG" ->
             Chan = string:sub_word(Line, 2),
             Msg = strip(string:substr(Line, 7+1+length(Chan)+1 +1)),
             io:fwrite(" [~s] ~s", [Chan, Msg]),
-            netsv ! {send_privmsg, Chan, Msg};
+            supervisor ! {send_privmsg, Chan, Msg};
         _ ->
             ok
     end.
 
 serve(Sock) ->
+    serve(Sock, []).
+serve(Sock, History) ->
     receive
         {upgrade} ->
             io:format("{proxy} Upgrading.~n"),
             ?MODULE:serve(Sock);
         {send, Command, Args} ->
             ok = send(Sock, Command, Args),
-            serve(Sock);
+            serve(Sock, History);
+        {forward, Line} ->
+            NextHist = forward(Sock, Line, History),
+            serve(Sock, NextHist);
         {tcp_closed, _} ->
             io:format("{proxy} Lost client. Opening new listener.~n"),
-            gen_tcp:close(Sock),
+            gen_tcp:close(Sock, History),
             ok;
         {tcp, Sock, Line} ->
             dispatch(Sock, lists:droplast(lists:droplast(Line))),
-            serve(Sock);
+            serve(Sock, History);
         Other ->
             io:fwrite("{proxy} Ignoring undefined message ~w~n", [Other]),
-            serve(Sock)
+            serve(Sock, History)
     end.

@@ -9,17 +9,38 @@ pick_worker(Workers) ->
     {Pid, Wname} = dict:fetch(Ref, Workers),
     {Pid, Wname}.
 
+make_worker(Index, Workers, Conf) ->
+    Wname = "net#" ++ integer_to_list(Index),
+    io:fwrite("{netsv} Spawning Worker ~s~n", [Wname]),
+    {Pid, Ref} = run_worker(Conf, Wname),
+    dict:store(Ref, {Pid, Wname}, Workers).
+
 netloop(Conf, Workers, NextN) ->
     receive
+        {reinstance} ->
+            dict:map(fun(_,{Pid,_}) -> Pid ! {reinstance} end, Workers),
+            netloop(Conf, Workers, NextN);
         {upgrade} ->
             io:format("{netsv} Upgrading.~n"),
-            dict:map(fun(_,{Pid,_}) -> Pid ! {upgrade} end, Workers),
-            ?MODULE:netloop(Conf, Workers, NextN);
+            {Pid, Wname} = pick_worker(Workers),
+            Pid ! {upgrade},
+            try
+                code:purge(?MODULE),
+                code:delete(?MODULE),
+                compile:file(?MODULE),
+                code:load_file(?MODULE),
+                ?MODULE:netloop(Conf, Workers, NextN)
+            catch
+                A:B ->
+                    io:fwrite("{netsv} Upgrade failed: ~w:~w.~n", [A,B]),
+                    netloop(Conf, Workers, NextN)
+            end;
         {send_join, Chans} ->
             io:fwrite("{netsv} Joining ~s.~n", [Chans]),
             dict:map(fun(_,{Pid,_}) -> Pid ! {send, "JOIN", ":"++Chans} end, Workers),
             netloop(Conf, Workers, NextN);
         {send_privmsg, Chan, Msg} ->
+            io:format("{netsv} Selecting...~n"),
             {Pid, Wname} = pick_worker(Workers),
             io:fwrite("{netsv} Dispatching to Worker ~s~n", [Wname]),
             case Msg of
@@ -29,22 +50,33 @@ netloop(Conf, Workers, NextN) ->
                     Pid ! {send, "PRIVMSG", Chan++" :"++Msg}
             end,
             netloop(Conf, Workers, NextN);
+        {spawn} ->
+            Workers_ = make_worker(NextN, Workers, Conf),
+            Conf_ = Conf#conf{wCur = length(Workers_)},
+            supervisor ! {count, length(Workers_)},
+            netloop(Conf_, Workers_, NextN+1);
         {'DOWN', Ref, process, _Pid, Reason} ->
             {_, {_, Wname}} = dict:find(Ref, Workers),
             io:fwrite("{netsv} Worker ~s stopped with reason: ~w~n", [Wname, Reason]),
             Workers_ = dict:erase(Ref, Workers),
-            Wname_ = "net#" ++ integer_to_list(NextN),
-            io:fwrite("{netsv} Spawning Worker ~s~n", [Wname_]),
-            {Pid_, Ref_} = run_worker(Conf, Wname_),
-            Workers__ = dict:store(Ref_, {Pid_, Wname_}, Workers_),
-            netloop(Conf, Workers__, NextN+1);
+            case length(Workers_) < Conf#conf.wMin of
+                true ->
+                    Workers__ = make_worker(NextN, Workers_, Conf),
+                    Conf_ = Conf#conf{wCur = length(Workers__)},
+                    supervisor ! {count, length(Workers__)},
+                    netloop(Conf_, Workers__, NextN+1);
+                false ->
+                    Conf_ = Conf#conf{wCur = length(Workers_)},
+                    supervisor ! {count, length(Workers_)},
+                    netloop(Conf_, Workers_, NextN)
+            end;
         Other ->
             io:fwrite("{netsv} Ignoring undefined message ~w~n", [Other]),
             netloop(Conf, Workers, NextN) 
     end.
 
 run_worker(Conf, Wname) ->
-    {Pid, Ref} = spawn_monitor(irc, start_worker, [Wname, Conf#conf.host, Conf#conf.port]),
+    {Pid, Ref} = spawn_monitor(irc, start_worker, [Wname, Conf]),
     register(list_to_atom(Wname), Pid),
     Pid ! {register},
     {Pid, Ref}.
@@ -52,7 +84,8 @@ run_worker(Conf, Wname) ->
 boot(Conf) ->
     register(netsv, self()),
     Workers = boot(Conf#conf.wMin, Conf),
-    svcsv ! {netsv, ready},
+    supervisor ! {netsv, ready},
+    supervisor ! {count, Conf#conf.wMin},
     netloop(Conf, dict:from_list(Workers), Conf#conf.wMin + 1).
 
 boot(Count, Conf) when Count > 0 ->

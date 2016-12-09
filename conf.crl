@@ -1,0 +1,4 @@
+HOST=abacus.subluminal.net
+PORT=6667
+COUNT=4
+CHAN="#programming"
